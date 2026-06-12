@@ -58,6 +58,7 @@ export default function App() {
   const [emplacements, setEmplacements] = useState([])
   const [mouvements, setMouvements] = useState([])
   const [degustations, setDegustations] = useState([])
+  const [refCustom, setRefCustom] = useState([])
   const [loading, setLoading] = useState(true)
   const [onglet, setOnglet] = useState('inventaire')
   const [filtreCouleur, setFiltreCouleur] = useState('Tous')
@@ -67,6 +68,8 @@ export default function App() {
   const [vinSelectionne, setVinSelectionne] = useState(null)
   const [showForm, setShowForm] = useState(false)
   const [formData, setFormData] = useState(EMPTY_FORM)
+  const [editingId, setEditingId] = useState(null)
+  const [scanning, setScanning] = useState(false)
   const [saving, setSaving] = useState(false)
   const [repasQuery, setRepasQuery] = useState('')
   const [suggestions, setSuggestions] = useState(null)
@@ -85,38 +88,75 @@ export default function App() {
 
   const loadAll = async () => {
     setLoading(true)
-    const [v, e, m, d] = await Promise.all([
+    const [v, e, m, d, rc] = await Promise.all([
       supabase.from('vins').select('*').order('nom'),
       supabase.from('emplacements').select('*').order('code'),
       supabase.from('mouvements').select('*, vins(nom, millesime)').order('date', { ascending: false }),
       supabase.from('degustations').select('*, vins(nom, millesime)').order('date_degustation', { ascending: false }),
+      supabase.from('referentiel_custom').select('*'),
     ])
     if (v.error) showToast('Erreur de chargement', 'err')
     setVins(v.data || [])
     setEmplacements(e.data || [])
     setMouvements(m.data || [])
     setDegustations(d.data || [])
+    setRefCustom(rc.data || [])
     setLoading(false)
   }
 
-  // ── Cascade Pays → Région → Appellation → Cépage ─────────────────────
+  // ── Cascade Pays → Région → Appellation → Cépage (+ entrées personnalisées) ──
+  const PAYS_LIST_COMPLET = useMemo(() => {
+    const customPays = [...new Set(refCustom.map(r => r.pays))]
+    return [...new Set([...PAYS_LIST, ...customPays])]
+  }, [refCustom])
+
   const regionsDisponibles = useMemo(() => {
     const p = formData.pays
-    if (!p || !referentiel[p]) return []
-    return Object.keys(referentiel[p])
-  }, [formData.pays])
+    const base = referentiel[p] ? Object.keys(referentiel[p]) : []
+    const custom = refCustom.filter(r => r.pays === p).map(r => r.region)
+    return [...new Set([...base, ...custom])]
+  }, [formData.pays, refCustom])
 
   const appellationsDisponibles = useMemo(() => {
-    const p = formData.pays, r = formData.region
-    if (!p || !r || !referentiel[p]?.[r]) return []
-    return Object.keys(referentiel[p][r])
-  }, [formData.pays, formData.region])
+    const { pays: p, region: r } = formData
+    const base = referentiel[p]?.[r] ? Object.keys(referentiel[p][r]) : []
+    const custom = refCustom.filter(x => x.pays === p && x.region === r).map(x => x.appellation)
+    return [...new Set([...base, ...custom])]
+  }, [formData.pays, formData.region, refCustom])
 
   const cepagesDisponibles = useMemo(() => {
     const { pays: p, region: r, appellation: a } = formData
-    if (!p || !r || !a || !referentiel[p]?.[r]?.[a]) return []
-    return referentiel[p][r][a]
-  }, [formData.pays, formData.region, formData.appellation])
+    const base = referentiel[p]?.[r]?.[a] || []
+    const custom = refCustom.filter(x => x.pays === p && x.region === r && x.appellation === a).map(x => x.cepage)
+    return [...new Set([...base, ...custom])].filter(c => c !== '—')
+  }, [formData.pays, formData.region, formData.appellation, refCustom])
+
+  // ── Ajout d'une nouvelle valeur (région/appellation/cépage) dans le formulaire ──
+  const ajouterValeurReferentiel = (niveau) => {
+    const labels = { region: 'une région', appellation: 'une appellation', cepage: 'un cépage' }
+    const valeur = window.prompt(`Nom de ${labels[niveau]} à ajouter :`)
+    if (!valeur || !valeur.trim()) return
+    const v = valeur.trim()
+    if (niveau === 'region') setFormData(p => ({ ...p, region: v, appellation: '', cepage: '' }))
+    if (niveau === 'appellation') setFormData(p => ({ ...p, appellation: v, cepage: '' }))
+    if (niveau === 'cepage') setFormData(p => ({ ...p, cepage: v }))
+  }
+
+  // ── Enregistre la combinaison Pays/Région/Appellation/Cépage si nouvelle ──
+  const sauvegarderReferentielSiNouveau = async (pays, region, appellation, cepage) => {
+    if (!pays || !region || !appellation) return
+    const cep = cepage || '—'
+    const dejaConnu = (referentiel[pays]?.[region]?.[appellation] || []).includes(cep)
+      || refCustom.some(r => r.pays === pays && r.region === region && r.appellation === appellation && r.cepage === cep)
+    if (dejaConnu) return
+    const { data, error } = await supabase.from('referentiel_custom')
+      .insert({ pays, region, appellation, cepage: cep })
+      .select().single()
+    if (!error && data) {
+      setRefCustom(p => [...p, data])
+      showToast('Nouvelle référence ajoutée à vos listes ✓')
+    }
+  }
 
   // ── Stats ──────────────────────────────────────────────────────────
   const vinsAvecStatut = useMemo(() => vins.map(v => ({ ...v, statut: calculerStatut(v) })), [vins])
@@ -173,7 +213,7 @@ export default function App() {
   }
 
   // ── CRUD vins ──────────────────────────────────────────────────────
-  const ajouterVin = async () => {
+  const enregistrerVin = async () => {
     setSaving(true)
     const payload = {
       ...formData,
@@ -186,9 +226,26 @@ export default function App() {
       date_achat: formData.date_achat || null,
       emplacement: formData.emplacement || null,
       id_bouteille: formData.id_bouteille || null,
-      cotations: null
     }
     delete payload.id
+
+    if (editingId) {
+      // ── Mode édition ──
+      const { data, error } = await supabase.from('vins').update(payload).eq('id', editingId).select().single()
+      if (error) { showToast('Erreur lors de la modification : ' + error.message, 'err'); setSaving(false); return }
+      await sauvegarderReferentielSiNouveau(data.pays, data.region, data.appellation, data.cepage)
+      await loadAll()
+      setVinSelectionne(data)
+      showToast('Vin modifié ✓')
+      setShowForm(false)
+      setEditingId(null)
+      setFormData(EMPTY_FORM)
+      setSaving(false)
+      return
+    }
+
+    // ── Mode ajout ──
+    payload.cotations = null
     const { data, error } = await supabase.from('vins').insert(payload).select().single()
     if (error) { showToast("Erreur lors de l'ajout : " + error.message, 'err'); setSaving(false); return }
 
@@ -200,11 +257,31 @@ export default function App() {
         emplacement_cible: data.emplacement, motif: 'Achat initial', commentaire: data.vendeur
       })
     }
+    // Sauvegarder la combinaison Pays/Région/Appellation/Cépage si nouvelle
+    await sauvegarderReferentielSiNouveau(data.pays, data.region, data.appellation, data.cepage)
+
     await loadAll()
     showToast('Vin ajouté ✓')
     setShowForm(false)
     setFormData(EMPTY_FORM)
     setSaving(false)
+  }
+
+  // ── Ouvrir le formulaire en mode édition ────────────────────────────
+  const ouvrirEdition = (vin) => {
+    setFormData({
+      id_bouteille: vin.id_bouteille || '', nom: vin.nom || '', producteur: vin.producteur || '',
+      millesime: vin.millesime ?? '', couleur: vin.couleur || 'Rouge', format: vin.format || 'Bouteille (75cl)',
+      pays: vin.pays || 'France', region: vin.region || '', appellation: vin.appellation || '', cepage: vin.cepage || '',
+      quantite: vin.quantite ?? 1, emplacement: vin.emplacement || '',
+      date_achat: vin.date_achat || '', vendeur: vin.vendeur || '', prix_unitaire: vin.prix_unitaire ?? '',
+      date_apogee: vin.date_apogee ?? '', fenetre_consommation: vin.fenetre_consommation || '', notes: vin.notes || '',
+      commentaire_degustation: vin.commentaire_degustation || '', note_perso: vin.note_perso ?? '',
+      accords: (vin.accords || []).join(', '), photo: vin.photo || null
+    })
+    setEditingId(vin.id)
+    setVinSelectionne(null)
+    setShowForm(true)
   }
 
   const updateVin = async (id, changes) => {
@@ -251,6 +328,45 @@ export default function App() {
     setShowDegustForm(false)
     setDegustForm({ appreciation: 5, invites: '', commentaires: '', moment_consommation: '', service_temperature: '' })
     showToast('Dégustation enregistrée ✓')
+  }
+
+  // ── Scanner une étiquette via IA (vision) ──────────────────────────
+  const scannerEtiquette = async () => {
+    if (!formData.photo) { showToast('Ajoutez une photo de l\'étiquette d\'abord', 'err'); return }
+    setScanning(true)
+    try {
+      const base64 = formData.photo.split(',')[1]
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514', max_tokens: 600,
+          system: 'Tu es un expert en vins capable de lire des étiquettes. Analyse la photo et extrait les informations visibles. Réponds UNIQUEMENT en JSON valide sans backticks, avec ces clés (mets null si non identifiable) : {"nom":"<nom du vin/cuvée>","producteur":"<nom du producteur/domaine/château>","millesime":<année ou null>,"couleur":"<Rouge|Blanc|Rosé|Effervescent|Liquoreux ou null>","pays":"<pays d\'origine ou null>","region":"<région viticole ou null>","appellation":"<appellation ou null>","cepage":"<cépage principal ou null>"}',
+          messages: [{
+            role: 'user', content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
+              { type: 'text', text: "Identifie ce vin à partir de son étiquette et remplis le JSON demandé." }
+            ]
+          }]
+        })
+      })
+      const data = await response.json()
+      const text = data.content?.filter(i => i.type === 'text').map(i => i.text).join('') || ''
+      const r = JSON.parse(text.replace(/```json|```/g, '').trim())
+      setFormData(p => ({
+        ...p,
+        nom: r.nom || p.nom,
+        producteur: r.producteur || p.producteur,
+        millesime: r.millesime || p.millesime,
+        couleur: COULEURS.includes(r.couleur) ? r.couleur : p.couleur,
+        pays: r.pays || p.pays,
+        region: r.region || p.region,
+        appellation: r.appellation || p.appellation,
+        cepage: r.cepage || p.cepage,
+      }))
+      showToast('Étiquette analysée ✓ — vérifiez les champs')
+    } catch { showToast("Impossible d'analyser l'étiquette", 'err') }
+    setScanning(false)
   }
 
   // ── Cotations IA ───────────────────────────────────────────────────
@@ -393,7 +509,7 @@ export default function App() {
                 <option value="statut">Statut</option>
                 <option value="prix">Prix</option>
               </select>
-              <button style={S.btnPrimary} onClick={() => { setFormData(EMPTY_FORM); setShowForm(true) }}>+ Ajouter</button>
+              <button style={S.btnPrimary} onClick={() => { setFormData(EMPTY_FORM); setEditingId(null); setShowForm(true) }}>+ Ajouter</button>
             </div>
 
             {loading ? (
@@ -647,6 +763,7 @@ export default function App() {
             <div style={{ borderTop: '1px solid #F0F0F0', paddingTop: 16, marginBottom: 16, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
               <button style={S.btnOutline} disabled={!vinSelectionne.quantite} onClick={() => enregistrerSortie(vinSelectionne, 1, 'Consommation')}>🍷 Boire une bouteille (-1)</button>
               <button style={S.btnOutline} onClick={() => setShowDegustForm(true)}>✍️ Ajouter une dégustation</button>
+              <button style={S.btnOutline} onClick={() => ouvrirEdition(vinSelectionne)}>✏️ Modifier</button>
             </div>
 
             {/* Cotations */}
@@ -733,10 +850,10 @@ export default function App() {
 
       {/* ══ MODAL AJOUT VIN ═════════════════════════════════════════ */}
       {showForm && (
-        <div style={S.modal} onClick={() => setShowForm(false)}>
+        <div style={S.modal} onClick={() => { setShowForm(false); setEditingId(null) }}>
           <div style={S.modalBox} className="modal-box" onClick={e => e.stopPropagation()}>
-            <button style={S.closeBtn} onClick={() => setShowForm(false)}>×</button>
-            <div style={{ fontFamily: "'Playfair Display', serif", fontSize: 19, marginBottom: 4 }}>🍷 Ajout d'une bouteille</div>
+            <button style={S.closeBtn} onClick={() => { setShowForm(false); setEditingId(null) }}>×</button>
+            <div style={{ fontFamily: "'Playfair Display', serif", fontSize: 19, marginBottom: 4 }}>{editingId ? '✏️ Modifier le vin' : "🍷 Ajout d'une bouteille"}</div>
             <div style={{ fontSize: 12, color: '#CCC', marginBottom: 18 }}>Les champs Pays / Région / Appellation / Cépage sont liés en cascade.</div>
 
             {/* Identification */}
@@ -749,6 +866,11 @@ export default function App() {
                     ? <img src={formData.photo} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
                     : <div style={{ textAlign: 'center', color: '#CCC', fontSize: 10.5, padding: 6 }}><div style={{ fontSize: 18, marginBottom: 4 }}>📷</div>Étiquette</div>}
                 </div>
+                {formData.photo && (
+                  <button type="button" style={{ ...S.btnOutline, marginTop: 6, width: 76, justifyContent: 'center', padding: '6px 4px', fontSize: 11 }} onClick={scannerEtiquette} disabled={scanning}>
+                    {scanning ? <Spinner /> : '🔍 Scanner'}
+                  </button>
+                )}
               </div>
               <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                 <div><label style={S.formLabel}>ID bouteille</label><input style={S.formInput} placeholder="B001" value={formData.id_bouteille} onChange={e => setFormData(p => ({ ...p, id_bouteille: e.target.value }))} /></div>
@@ -775,37 +897,53 @@ export default function App() {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 16 }}>
               <div>
                 <label style={S.formLabel}>Pays d'origine</label>
-                <select style={{ ...S.formInput, cursor: 'pointer' }} value={formData.pays} onChange={e => setFormData(p => ({ ...p, pays: e.target.value, region: '', appellation: '', cepage: '' }))}>
-                  {PAYS_LIST.map(p => <option key={p}>{p}</option>)}
-                </select>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <select style={{ ...S.formInput, cursor: 'pointer' }} value={formData.pays} onChange={e => setFormData(p => ({ ...p, pays: e.target.value, region: '', appellation: '', cepage: '' }))}>
+                    {PAYS_LIST_COMPLET.map(p => <option key={p}>{p}</option>)}
+                    {formData.pays && !PAYS_LIST_COMPLET.includes(formData.pays) && <option key={formData.pays}>{formData.pays}</option>}
+                  </select>
+                  <button type="button" style={{ ...S.btnOutline, padding: '9px 12px', flexShrink: 0 }} onClick={() => {
+                    const v = window.prompt('Nom du nouveau pays :')
+                    if (v && v.trim()) setFormData(p => ({ ...p, pays: v.trim(), region: '', appellation: '', cepage: '' }))
+                  }} title="Ajouter un nouveau pays">+</button>
+                </div>
               </div>
               <div>
                 <label style={S.formLabel}>Région</label>
-                {regionsDisponibles.length > 0 ? (
+                <div style={{ display: 'flex', gap: 6 }}>
                   <select style={{ ...S.formInput, cursor: 'pointer' }} value={formData.region} onChange={e => setFormData(p => ({ ...p, region: e.target.value, appellation: '', cepage: '' }))}>
                     <option value="">—</option>
                     {regionsDisponibles.map(r => <option key={r}>{r}</option>)}
+                    {formData.region && !regionsDisponibles.includes(formData.region) && <option key={formData.region}>{formData.region}</option>}
                   </select>
-                ) : <input style={S.formInput} value={formData.region} onChange={e => setFormData(p => ({ ...p, region: e.target.value }))} placeholder="Saisie libre" />}
+                  <button type="button" style={{ ...S.btnOutline, padding: '9px 12px', flexShrink: 0 }} onClick={() => ajouterValeurReferentiel('region')} title="Ajouter une nouvelle région">+</button>
+                </div>
               </div>
               <div>
                 <label style={S.formLabel}>Appellation</label>
-                {appellationsDisponibles.length > 0 ? (
+                <div style={{ display: 'flex', gap: 6 }}>
                   <select style={{ ...S.formInput, cursor: 'pointer' }} value={formData.appellation} onChange={e => setFormData(p => ({ ...p, appellation: e.target.value, cepage: '' }))}>
                     <option value="">—</option>
                     {appellationsDisponibles.map(a => <option key={a}>{a}</option>)}
+                    {formData.appellation && !appellationsDisponibles.includes(formData.appellation) && <option key={formData.appellation}>{formData.appellation}</option>}
                   </select>
-                ) : <input style={S.formInput} value={formData.appellation} onChange={e => setFormData(p => ({ ...p, appellation: e.target.value }))} placeholder="Saisie libre" />}
+                  <button type="button" style={{ ...S.btnOutline, padding: '9px 12px', flexShrink: 0 }} onClick={() => ajouterValeurReferentiel('appellation')} title="Ajouter une nouvelle appellation">+</button>
+                </div>
               </div>
               <div>
                 <label style={S.formLabel}>Cépage</label>
-                {cepagesDisponibles.length > 0 ? (
+                <div style={{ display: 'flex', gap: 6 }}>
                   <select style={{ ...S.formInput, cursor: 'pointer' }} value={formData.cepage} onChange={e => setFormData(p => ({ ...p, cepage: e.target.value }))}>
                     <option value="">—</option>
                     {cepagesDisponibles.map(c => <option key={c}>{c}</option>)}
+                    {formData.cepage && !cepagesDisponibles.includes(formData.cepage) && <option key={formData.cepage}>{formData.cepage}</option>}
                   </select>
-                ) : <input style={S.formInput} value={formData.cepage} onChange={e => setFormData(p => ({ ...p, cepage: e.target.value }))} placeholder="Saisie libre" />}
+                  <button type="button" style={{ ...S.btnOutline, padding: '9px 12px', flexShrink: 0 }} onClick={() => ajouterValeurReferentiel('cepage')} title="Ajouter un nouveau cépage">+</button>
+                </div>
               </div>
+            </div>
+            <div style={{ fontSize: 11.5, color: '#CCC', marginTop: -8, marginBottom: 16 }}>
+              💡 Utilisez le bouton <b>+</b> pour ajouter une région, appellation ou cépage absent des listes — elle sera proposée automatiquement la prochaine fois.
             </div>
 
             {/* Stock & emplacement */}
@@ -857,8 +995,8 @@ export default function App() {
               <textarea style={{ ...S.formInput, minHeight: 65, resize: 'vertical' }} value={formData.commentaire_degustation} onChange={e => setFormData(p => ({ ...p, commentaire_degustation: e.target.value }))} />
             </div>
 
-            <button style={{ ...S.btnPrimary, width: '100%', padding: 13, fontSize: 15, justifyContent: 'center' }} onClick={ajouterVin} disabled={saving || !formData.nom}>
-              {saving ? <><Spinner /> Sauvegarde…</> : "Ajouter à l'inventaire"}
+            <button style={{ ...S.btnPrimary, width: '100%', padding: 13, fontSize: 15, justifyContent: 'center' }} onClick={enregistrerVin} disabled={saving || !formData.nom}>
+              {saving ? <><Spinner /> Sauvegarde…</> : editingId ? 'Enregistrer les modifications' : "Ajouter à l'inventaire"}
             </button>
           </div>
         </div>
